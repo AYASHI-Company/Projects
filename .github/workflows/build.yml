@@ -87,9 +87,9 @@ jobs:
                   bg=dark?0xFF0B1117:0xFFF1F5F5;card=dark?0xFF151F29:Color.WHITE;fg=dark?0xFFF0F6FA:0xFF172B36;secondary=dark?0xFF9BABBA:0xFF5C717C;accent=dark?0xFF79E2BD:0xFF147C62;line=dark?0xFF293744:0xFFE0E9ED;unit=prefs.getInt("unit",1);
                   getWindow().setStatusBarColor(bg);getWindow().setNavigationBarColor(bg);getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);getWindow().getDecorView().setSystemUiVisibility(dark?0:View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR|View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
                   ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.setBackgroundColor(bg);scroll.setClipToPadding(false);
-                  LinearLayout root=column();root.setPadding(dp(20),dp(24),dp(20),dp(24));scroll.addView(root);setContentView(scroll);
+                  LinearLayout root=column();root.setPadding(dp(20),dp(24),dp(20),dp(16));scroll.addView(root);LinearLayout shell=column();shell.setBackgroundColor(bg);shell.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));LinearLayout dock=column();dock.setPadding(dp(20),dp(12),dp(20),dp(16));shell.addView(dock,new LinearLayout.LayoutParams(-1,-2));setContentView(shell);
                   // Target-35 edge-to-edge insets: keep controls clear of bars and keyboard.
-                  root.setOnApplyWindowInsetsListener((v,insets)->{v.setPadding(dp(20),dp(20)+insets.getSystemWindowInsetTop(),dp(20),dp(24)+insets.getSystemWindowInsetBottom());return insets;});root.requestApplyInsets();
+                  shell.setOnApplyWindowInsetsListener((v,insets)->{v.setPadding(0,insets.getSystemWindowInsetTop(),0,insets.getSystemWindowInsetBottom());return insets;});shell.requestApplyInsets();
                   LinearLayout header=row();LinearLayout names=column();names.addView(label("NETWORK MONITOR",10,accent));TextView name=label("Data Watch",27,fg);name.setTypeface(null,Typeface.BOLD);names.addView(name);header.addView(names,new LinearLayout.LayoutParams(0,-2,1));
                   TextView theme=label(dark?"Light":"Dark",13,secondary);theme.setPadding(dp(16),dp(12),dp(16),dp(12));theme.setBackground(shape(card,18));theme.setContentDescription(dark?"Switch to light theme":"Switch to dark theme");theme.setOnClickListener(v->{save(false);prefs.edit().putBoolean("dark",!dark).apply();recreate();});header.addView(theme);root.addView(header);gap(root,24);
                   LinearLayout hero=card(root);LinearLayout top=row();top.addView(label("LIVE SPEED",11,secondary),new LinearLayout.LayoutParams(0,-2,1));status=label("PAUSED",11,accent);top.addView(status);hero.addView(top);gap(hero,14);
@@ -111,9 +111,9 @@ jobs:
                   View divider=new View(this);divider.setBackgroundColor(line);alerts.addView(divider,new LinearLayout.LayoutParams(-1,dp(1)));gap(alerts,12);
                   LinearLayout floating=row();LinearLayout floatingNames=column();floatingNames.addView(label("Show over other apps",14,fg));permissionLabel=label("Tap to allow floating alerts",12,secondary);floatingNames.addView(permissionLabel);floating.addView(floatingNames,new LinearLayout.LayoutParams(0,-2,1));TextView manage=label("Manage  ›",13,accent);floating.addView(manage);floating.setPadding(0,dp(6),0,dp(8));floating.setOnClickListener(v->overlaySettings());floating.setContentDescription("Manage floating alert permission");alerts.addView(floating);
                   errorLabel=label("",12,0xFFFFAA8A);root.addView(errorLabel);gap(root,4);
-                  monitorButton=button("Start monitoring",accent);monitorButton.setContentDescription("Start or stop monitoring");root.addView(monitorButton,new LinearLayout.LayoutParams(-1,dp(56)));monitorButton.setOnClickListener(v->{if(MonitorService.running)stopService(new Intent(this,MonitorService.class));else startMonitoring();});
-                  gap(root,10);muteButton=button("Mute this spike",dark?0xFFFFB495:0xFFBD4D30);root.addView(muteButton,new LinearLayout.LayoutParams(-1,dp(52)));muteButton.setOnClickListener(v->startService(new Intent(this,MonitorService.class).setAction("MUTE")));muteButton.setVisibility(View.GONE);gap(root,10);
-                  metricSummary=label("",11,secondary);metricSummary.setGravity(Gravity.CENTER);root.addView(metricSummary);
+                  monitorButton=button("Start monitoring",accent);monitorButton.setContentDescription("Start or stop monitoring");dock.addView(monitorButton,new LinearLayout.LayoutParams(-1,dp(56)));monitorButton.setOnClickListener(v->{if(MonitorService.running)stopService(new Intent(this,MonitorService.class));else startMonitoring();});
+                  gap(dock,8);muteButton=button("Mute this spike",dark?0xFFFFB495:0xFFBD4D30);dock.addView(muteButton,new LinearLayout.LayoutParams(-1,dp(48)));muteButton.setOnClickListener(v->startService(new Intent(this,MonitorService.class).setAction("MUTE")));muteButton.setVisibility(View.GONE);gap(dock,6);
+                  metricSummary=label("",11,secondary);metricSummary.setGravity(Gravity.CENTER);dock.addView(metricSummary);
                   initializing=false;
               }
               private void paintUnits(){for(int i=0;i<3;i++){unitButtons[i].setTextColor(i==unit?accent:secondary);unitButtons[i].setBackground(shape(i==unit?(dark?0xFF203B35:0xFFE4F3ED):card,11));}if(unitLabel!=null)unitLabel.setText(Prefs.UNITS[unit]);}
@@ -546,6 +546,9 @@ jobs:
           set -euo pipefail
           export JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME}"
           export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export ANDROID_USER_HOME="$PWD/build/android-user"
+          export ANDROID_AVD_HOME="$ANDROID_USER_HOME/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           BT="$ANDROID_HOME/build-tools/35.0.0"
           PLATFORM="$ANDROID_HOME/platforms/android-35/android.jar"
           mkdir -p build/ui-classes build/ui-dex ui-results
@@ -557,10 +560,19 @@ jobs:
           "$BT/zipalign" -f 4 build/ui-base.apk build/ui-aligned.apk
           "$BT/apksigner" sign --ks build/personal.keystore --ks-key-alias datawatch --ks-pass pass:android --out build/ui-tests.apk build/ui-aligned.apk
           sdkmanager 'emulator' 'system-images;android-35;google_apis;x86_64' > ui-results/sdk.txt
-          echo no | avdmanager create avd --force --name datawatch --package 'system-images;android-35;google_apis;x86_64' --device pixel_5
+          avdmanager create avd --force --name datawatch --path "$ANDROID_AVD_HOME/datawatch.avd" --package 'system-images;android-35;google_apis;x86_64' --device pixel_5 <<< no
+          printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-35\n' "$ANDROID_AVD_HOME/datawatch.avd" > "$ANDROID_AVD_HOME/datawatch.ini"
           sudo chmod a+rw /dev/kvm
+          adb start-server
           emulator -avd datawatch -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -accel on > ui-results/emulator.txt 2>&1 &
-          timeout 240 bash -c 'until adb shell getprop sys.boot_completed 2>/dev/null | grep -q 1; do sleep 3; done'
+          emulator_pid=$!
+          booted=0
+          for attempt in $(seq 1 80); do
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then cat ui-results/emulator.txt; exit 1; fi
+            if timeout 5 adb shell getprop sys.boot_completed 2>/dev/null | grep -q 1; then booted=1; break; fi
+            sleep 3
+          done
+          if [[ "$booted" != 1 ]]; then cat ui-results/emulator.txt; exit 1; fi
           adb shell input keyevent 82
           adb install -r dist/DataWatch.apk
           adb install -r build/ui-tests.apk
