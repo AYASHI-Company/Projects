@@ -545,7 +545,7 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           export JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME}"
-          export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           BT="$ANDROID_HOME/build-tools/35.0.0"
           PLATFORM="$ANDROID_HOME/platforms/android-35/android.jar"
           mkdir -p build/ui-classes build/ui-dex ui-results
