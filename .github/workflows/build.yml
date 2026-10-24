@@ -280,7 +280,7 @@ jobs:
           "$BT/aapt2" compile --dir res -o build/resources.zip
           "$BT/aapt2" link -o build/base.apk --manifest AndroidManifest.xml -I "$PLATFORM" --java build/generated --min-sdk-version 26 --target-sdk-version 35 -0 wav build/resources.zip
           find src build/generated -name '*.java' | sort > build/sources.txt
-          javac -encoding UTF-8 -source 8 -target 8 -bootclasspath "$PLATFORM" -d build/classes @build/sources.txt
+          javac -encoding UTF-8 --release 8 -classpath "$PLATFORM" -d build/classes @build/sources.txt
           jar cf build/classes.jar -C build/classes .
           "$BT/d8" --lib "$PLATFORM" --min-api 26 --output build/dex build/classes.jar
           jar uf build/base.apk -C build/dex classes.dex
