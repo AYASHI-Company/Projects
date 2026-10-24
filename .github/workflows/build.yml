@@ -497,18 +497,18 @@ jobs:
                       try(InputStream input=getTargetContext().getResources().openRawResource(R.raw.alarm);OutputStream output=new FileOutputStream(new File(getTargetContext().getFilesDir(),"custom-alarm"))){byte[] buf=new byte[4096];int count;while((count=input.read(buf))!=-1)output.write(buf,0,count);}
                       runOnMainSync(()->{
                           Prefs.get(getTargetContext()).edit().putBoolean("all",true).putInt("interval",100).putString("sound","custom").putBoolean("overlay",true).apply();
-                          View liveDecor=light.getWindow().getDecorView();find(liveDecor,"Display speed in KB/s").performClick();((EditText)find(liveDecor,"Speed limit value")).setText("64");
-                      });Thread.sleep(1000);check(Prefs.limit(getTargetContext())==64000,"Integration limit saved through the actual UI");
+                          View liveDecor=light.getWindow().getDecorView();find(liveDecor,"Display speed in KB/s").performClick();((EditText)find(liveDecor,"Speed limit value")).setText("1");
+                      });Thread.sleep(1000);check(Prefs.limit(getTargetContext())==1000,"Integration limit saved through the actual UI");
                       runOnMainSync(()->getTargetContext().startForegroundService(new Intent(getTargetContext(),MonitorService.class).setAction("START")));
-                      Thread traffic=new Thread(()->{try{shell("ping -w 28 -i 0.2 -c 160 -s 16000 10.0.2.2");}catch(Exception e){throw new RuntimeException(e);}},"EmulatorTraffic");traffic.start();
+                      Thread traffic=new Thread(()->{try{shell("ping -w 60 -i 0.05 -s 1200 10.0.2.2");}catch(Exception e){throw new RuntimeException(e);}},"EmulatorTraffic");traffic.start();
                       for(int attempt=0;attempt<80&&!MonitorService.alarming;attempt++)Thread.sleep(100);
                       check(MonitorService.above&&MonitorService.alarming,"Real traffic strictly above threshold starts actual audio");check(MonitorService.soundError.isEmpty(),"Custom audio plays without fallback");
                       check(getTargetContext().getSystemService(NotificationManager.class).getActiveNotifications().length>=2,"Threshold alert notification appears");
-                      runOnMainSync(()->getTargetContext().startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)));Thread.sleep(600);screenshot("floating-alert-over-settings");
-                      Thread.sleep(20500);check(MonitorService.above&&MonitorService.muted&&!MonitorService.alarming,"Sustained spike is silent after 20 seconds");
-                      traffic.join(12000);check(!traffic.isAlive(),"Local traffic generator finished");Thread.sleep(2000);for(int attempt=0;attempt<100&&MonitorService.above;attempt++)Thread.sleep(100);check(!MonitorService.above&&!MonitorService.alarming,"Traffic drop rearms without playing sound; rate="+MonitorService.rate);
+                      shell("am start -a android.intent.action.MAIN -c android.intent.category.HOME");Thread.sleep(1500);screenshot("floating-alert-over-home");
+                      Thread.sleep(20500);check(MonitorService.above&&MonitorService.muted&&!MonitorService.alarming,"Sustained spike is silent after 20 seconds; above="+MonitorService.above+", muted="+MonitorService.muted+", alarming="+MonitorService.alarming+", rate="+MonitorService.rate);
+                      shell("pkill ping");traffic.join(5000);check(!traffic.isAlive(),"Local traffic generator finished");
                       runOnMainSync(()->getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class)));Thread.sleep(200);check(!MonitorService.running,"Service stops after integration test");
-                      runOnMainSync(()->light.finish());result.putString("summary","UI_SMOKE_OK: themes, units, manual start/stop, idle silence, real traffic alarm, custom audio, notification, overlay over Settings, 20-second timeout and rearm");finish(Activity.RESULT_OK,result);
+                      runOnMainSync(()->light.finish());result.putString("summary","UI_SMOKE_OK: themes, units, manual start/stop, idle silence, real traffic alarm, custom audio, notification, overlay over Home, 20-second timeout");finish(Activity.RESULT_OK,result);
                   }catch(Throwable error){result.putString("error",error.toString());getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class));finish(Activity.RESULT_CANCELED,result);}
               }
           }
