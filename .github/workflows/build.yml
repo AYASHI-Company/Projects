@@ -9,18 +9,19 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Create app source
         shell: bash
         run: |
           cat > 'AndroidManifest.xml' <<'DATAWATCH_SOURCE_EOF'
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.datawatch.alarm" android:versionCode="1" android:versionName="1.0">
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.datawatch.alarm" android:versionCode="2" android:versionName="2.0">
               <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <application android:label="Data Watch" android:theme="@android:style/Theme.Material.NoActionBar" android:allowBackup="false" android:icon="@drawable/icon" android:supportsRtl="true">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
@@ -36,170 +37,258 @@ jobs:
           package com.datawatch.alarm;
           
           import android.app.*;
-          import android.os.*;
           import android.content.*;
           import android.content.pm.PackageManager;
+          import android.content.res.ColorStateList;
+          import android.database.Cursor;
           import android.graphics.Color;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
+          import android.media.RingtoneManager;
+          import android.net.Uri;
+          import android.os.*;
+          import android.provider.OpenableColumns;
           import android.provider.Settings;
-          import android.text.InputType;
+          import android.text.*;
           import android.view.*;
           import android.widget.*;
+          import java.io.*;
           import java.util.Locale;
           
           public class MainActivity extends Activity {
-              private final Handler handler = new Handler();
-              private TextView speed, status;
-              private EditText threshold;
-              private Switch allNetworks;
-              private Button start;
-              private final int mint = Color.rgb(85,228,188);
-              private final Runnable refresh = new Runnable() {
-                  public void run() {
-                      speed.setText(String.format(Locale.US, "%.2f", MonitorService.rate / 1_000_000.0));
-                      status.setText(MonitorService.message);
-                      status.setTextColor(MonitorService.alarming ? Color.rgb(255,155,128) : mint);
-                      threshold.setEnabled(!MonitorService.running);
-                      allNetworks.setEnabled(!MonitorService.running);
-                      start.setEnabled(!MonitorService.running);
-                      handler.postDelayed(this, 500);
-                  }
-              };
-              private int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
-              private TextView text(String s, int size, int color) {
-                  TextView t = new TextView(this); t.setText(s); t.setTextSize(size); t.setTextColor(color); return t;
+              private final Handler handler=new Handler(Looper.getMainLooper());
+              private android.content.SharedPreferences prefs;
+              private TextView liveSpeed,unitLabel,status,downloadLabel,uploadLabel,soundLabel,permissionLabel,errorLabel,metricSummary;
+              private EditText limitInput;
+              private Button monitorButton,muteButton;
+              private Sparkline chart;
+              private int bg,card,fg,secondary,accent,line,unit;
+              private boolean dark,initializing=true,pendingStart,importing;
+              private long lastChart;
+              private final TextView[] unitButtons=new TextView[3];
+              private int dp(int n){return Math.round(n*getResources().getDisplayMetrics().density);}
+              private GradientDrawable shape(int color,int radius){GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));return d;}
+              private TextView label(String s,int size,int color){TextView t=new TextView(this);t.setText(s);t.setTextSize(size);t.setTextColor(color);t.setFontFeatureSettings("tnum");return t;}
+              private void gap(LinearLayout p,int h){p.addView(new View(this),new LinearLayout.LayoutParams(1,dp(h)));}
+              private LinearLayout column(){LinearLayout l=new LinearLayout(this);l.setOrientation(1);return l;}
+              private LinearLayout row(){LinearLayout l=new LinearLayout(this);l.setGravity(Gravity.CENTER_VERTICAL);return l;}
+              private LinearLayout card(LinearLayout root){LinearLayout c=column();c.setPadding(dp(22),dp(20),dp(22),dp(20));c.setBackground(shape(card,24));LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.bottomMargin=dp(14);root.addView(c,lp);return c;}
+              private void title(LinearLayout p,String s){TextView t=label(s,17,fg);t.setTypeface(null,Typeface.BOLD);p.addView(t);}
+              private Button button(String text,int color){Button b=new Button(this);b.setText(text);b.setTextSize(16);b.setAllCaps(false);b.setTypeface(null,Typeface.BOLD);b.setTextColor(dark?0xFF10251F:Color.WHITE);b.setBackground(shape(color,18));b.setMinHeight(dp(54));return b;}
+              private Spinner selector(String[] entries,int selection){
+                  Spinner s=new Spinner(this);
+                  ArrayAdapter<String> adapter=new ArrayAdapter<String>(this,android.R.layout.simple_spinner_item,entries){
+                      @Override public View getView(int p,View v,android.view.ViewGroup parent){TextView t=(TextView)super.getView(p,v,parent);t.setTextColor(fg);t.setTextSize(14);t.setPadding(0,dp(8),dp(8),dp(8));return t;}
+                  };
+                  adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);s.setAdapter(adapter);s.setSelection(selection);return s;
               }
-              private void gap(LinearLayout parent, int n) { View v = new View(this); parent.addView(v, new LinearLayout.LayoutParams(1, dp(n))); }
-              private Button button(String label, int color, LinearLayout parent) {
-                  Button b = new Button(this); b.setText(label); b.setAllCaps(false); b.setTextColor(Color.rgb(10,25,33));
-                  GradientDrawable shape = new GradientDrawable(); shape.setColor(color); shape.setCornerRadius(dp(14)); b.setBackground(shape);
-                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, dp(54)); p.bottomMargin = dp(12); parent.addView(b,p); return b;
+              @Override public void onCreate(Bundle saved){
+                  prefs=Prefs.get(this);dark=prefs.getBoolean("dark",true);setTheme(dark?android.R.style.Theme_Material_NoActionBar:android.R.style.Theme_Material_Light_NoActionBar);super.onCreate(saved);
+                  bg=dark?0xFF0B1117:0xFFF1F5F5;card=dark?0xFF151F29:Color.WHITE;fg=dark?0xFFF0F6FA:0xFF172B36;secondary=dark?0xFF9BABBA:0xFF5C717C;accent=dark?0xFF79E2BD:0xFF147C62;line=dark?0xFF293744:0xFFE0E9ED;unit=prefs.getInt("unit",1);
+                  getWindow().setStatusBarColor(bg);getWindow().setNavigationBarColor(bg);getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);getWindow().getDecorView().setSystemUiVisibility(dark?0:View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR|View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+                  ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.setBackgroundColor(bg);scroll.setClipToPadding(false);
+                  LinearLayout root=column();root.setPadding(dp(20),dp(24),dp(20),dp(24));scroll.addView(root);setContentView(scroll);
+                  // Target-35 edge-to-edge insets: keep controls clear of bars and keyboard.
+                  root.setOnApplyWindowInsetsListener((v,insets)->{v.setPadding(dp(20),dp(20)+insets.getSystemWindowInsetTop(),dp(20),dp(24)+insets.getSystemWindowInsetBottom());return insets;});root.requestApplyInsets();
+                  LinearLayout header=row();LinearLayout names=column();names.addView(label("NETWORK MONITOR",10,accent));TextView name=label("Data Watch",27,fg);name.setTypeface(null,Typeface.BOLD);names.addView(name);header.addView(names,new LinearLayout.LayoutParams(0,-2,1));
+                  TextView theme=label(dark?"Light":"Dark",13,secondary);theme.setPadding(dp(16),dp(12),dp(16),dp(12));theme.setBackground(shape(card,18));theme.setContentDescription(dark?"Switch to light theme":"Switch to dark theme");theme.setOnClickListener(v->{save(false);prefs.edit().putBoolean("dark",!dark).apply();recreate();});header.addView(theme);root.addView(header);gap(root,24);
+                  LinearLayout hero=card(root);LinearLayout top=row();top.addView(label("LIVE SPEED",11,secondary),new LinearLayout.LayoutParams(0,-2,1));status=label("PAUSED",11,accent);top.addView(status);hero.addView(top);gap(hero,14);
+                  LinearLayout speedRow=row();speedRow.setGravity(Gravity.BOTTOM);liveSpeed=label("0.00",58,fg);liveSpeed.setTypeface(Typeface.create("sans-serif-light",Typeface.NORMAL));liveSpeed.setSingleLine(true);liveSpeed.setAutoSizeTextTypeUniformWithConfiguration(28,58,2,android.util.TypedValue.COMPLEX_UNIT_SP);liveSpeed.setContentDescription("Live network speed");speedRow.addView(liveSpeed,new LinearLayout.LayoutParams(0,dp(82),1));unitLabel=label(Prefs.UNITS[unit],18,secondary);unitLabel.setPadding(dp(8),0,0,dp(9));speedRow.addView(unitLabel);hero.addView(speedRow);
+                  LinearLayout units=row();for(int i=0;i<3;i++){final int n=i;TextView chip=label(Prefs.UNITS[i],12,secondary);chip.setGravity(Gravity.CENTER);chip.setPadding(dp(12),dp(9),dp(12),dp(9));chip.setOnClickListener(v->changeUnit(n));chip.setContentDescription("Display speed in "+Prefs.UNITS[i]);LinearLayout.LayoutParams up=new LinearLayout.LayoutParams(0,dp(38),1);up.setMargins(i==0?0:dp(6),0,0,0);units.addView(chip,up);unitButtons[i]=chip;}hero.addView(units);gap(hero,10);paintUnits();
+                  chart=new Sparkline(this,accent,line);hero.addView(chart,new LinearLayout.LayoutParams(-1,dp(94)));gap(hero,8);
+                  LinearLayout traffic=row();downloadLabel=label("↓ 0.00 "+Prefs.UNITS[unit],12,secondary);uploadLabel=label("↑ 0.00 "+Prefs.UNITS[unit],12,secondary);traffic.addView(downloadLabel,new LinearLayout.LayoutParams(0,-2,1));traffic.addView(uploadLabel);hero.addView(traffic);
+                  LinearLayout limits=card(root);title(limits,"Speed limit");gap(limits,8);LinearLayout entry=row();limitInput=new EditText(this);limitInput.setTextColor(fg);limitInput.setTextSize(28);limitInput.setSingleLine(true);limitInput.setInputType(InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_FLAG_DECIMAL);limitInput.setBackgroundTintList(ColorStateList.valueOf(accent));limitInput.setText(prefs.getString("limit","1"));limitInput.setContentDescription("Speed limit value");entry.addView(limitInput,new LinearLayout.LayoutParams(0,dp(62),1));TextView limitUnit=label(Prefs.UNITS[unit],16,secondary);limitUnit.setTag("limit-unit");entry.addView(limitUnit);limits.addView(entry);limits.addView(label("Alarm only above this rate · stops within 20 seconds",12,secondary));
+                  limitInput.addTextChangedListener(new TextWatcher(){public void beforeTextChanged(CharSequence s,int a,int c,int f){}public void onTextChanged(CharSequence s,int a,int b,int c){if(!initializing){handler.removeCallbacks(applySettings);handler.postDelayed(applySettings,700);}}public void afterTextChanged(Editable e){}});
+                  gap(limits,16);LinearLayout network=row();network.addView(label("Monitor",14,secondary),new LinearLayout.LayoutParams(0,-2,1));Spinner networks=selector(new String[]{"Mobile data","All networks"},prefs.getBoolean("all",false)?1:0);network.addView(networks);limits.addView(network);
+                  networks.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onNothingSelected(AdapterView<?> a){}public void onItemSelected(AdapterView<?> a,View v,int p,long id){if(prefs.getBoolean("all",false)!=(p==1)){prefs.edit().putBoolean("all",p==1).apply();save(true);}}});
+                  LinearLayout direction=row();direction.addView(label("Count",14,secondary),new LinearLayout.LayoutParams(0,-2,1));Spinner metricPicker=selector(new String[]{"Download + upload","Download only","Upload only"},prefs.getInt("metric",0));direction.addView(metricPicker);limits.addView(direction);
+                  metricPicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onNothingSelected(AdapterView<?> a){}public void onItemSelected(AdapterView<?> a,View v,int p,long id){if(p!=prefs.getInt("metric",0)){prefs.edit().putInt("metric",p).apply();save(true);}}});
+                  LinearLayout sampling=row();sampling.addView(label("Check every",14,secondary),new LinearLayout.LayoutParams(0,-2,1));int interval=prefs.getInt("interval",1000);int selected=interval==100?0:interval==250?1:interval==500?2:3;Spinner timing=selector(new String[]{"100 ms","250 ms","500 ms","1 second"},selected);sampling.addView(timing);limits.addView(sampling);
+                  timing.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onNothingSelected(AdapterView<?> a){}public void onItemSelected(AdapterView<?> a,View v,int p,long id){int ms=new int[]{100,250,500,1000}[p];if(ms!=prefs.getInt("interval",1000)){prefs.edit().putInt("interval",ms).apply();save(true);}}});
+                  limits.addView(label("Faster checks refresh a rolling 1-second average.",11,secondary));
+                  LinearLayout alerts=card(root);title(alerts,"Alerts");gap(alerts,14);
+                  LinearLayout soundRow=row();LinearLayout soundNames=column();soundNames.addView(label("Alarm sound",14,fg));soundLabel=label(prefs.getString("sound-name","Built-in pulse"),12,secondary);soundNames.addView(soundLabel);soundRow.addView(soundNames,new LinearLayout.LayoutParams(0,-2,1));soundRow.addView(label("Change  ›",13,accent));soundRow.setPadding(0,dp(4),0,dp(14));soundRow.setContentDescription("Choose alarm sound");soundRow.setOnClickListener(v->chooseSound());alerts.addView(soundRow);
+                  View divider=new View(this);divider.setBackgroundColor(line);alerts.addView(divider,new LinearLayout.LayoutParams(-1,dp(1)));gap(alerts,12);
+                  LinearLayout floating=row();LinearLayout floatingNames=column();floatingNames.addView(label("Show over other apps",14,fg));permissionLabel=label("Tap to allow floating alerts",12,secondary);floatingNames.addView(permissionLabel);floating.addView(floatingNames,new LinearLayout.LayoutParams(0,-2,1));TextView manage=label("Manage  ›",13,accent);floating.addView(manage);floating.setPadding(0,dp(6),0,dp(8));floating.setOnClickListener(v->overlaySettings());floating.setContentDescription("Manage floating alert permission");alerts.addView(floating);
+                  errorLabel=label("",12,0xFFFFAA8A);root.addView(errorLabel);gap(root,4);
+                  monitorButton=button("Start monitoring",accent);monitorButton.setContentDescription("Start or stop monitoring");root.addView(monitorButton,new LinearLayout.LayoutParams(-1,dp(56)));monitorButton.setOnClickListener(v->{if(MonitorService.running)stopService(new Intent(this,MonitorService.class));else startMonitoring();});
+                  gap(root,10);muteButton=button("Mute this spike",dark?0xFFFFB495:0xFFBD4D30);root.addView(muteButton,new LinearLayout.LayoutParams(-1,dp(52)));muteButton.setOnClickListener(v->startService(new Intent(this,MonitorService.class).setAction("MUTE")));muteButton.setVisibility(View.GONE);gap(root,10);
+                  metricSummary=label("",11,secondary);metricSummary.setGravity(Gravity.CENTER);root.addView(metricSummary);
+                  initializing=false;
               }
-              @Override public void onCreate(Bundle state) {
-                  super.onCreate(state);
-                  getWindow().setStatusBarColor(Color.rgb(10,22,31)); getWindow().setNavigationBarColor(Color.rgb(10,22,31));
-                  ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setBackgroundColor(Color.rgb(10,22,31));
-                  LinearLayout root = new LinearLayout(this); root.setOrientation(1); root.setPadding(dp(26),dp(32),dp(26),dp(28)); scroll.addView(root); setContentView(scroll);
-                  root.addView(text("DATA WATCH",14,mint)); gap(root,12);
-                  TextView title=text("Catch the spike.",32,Color.WHITE); title.setTypeface(null,Typeface.BOLD); root.addView(title); gap(root,8);
-                  root.addView(text("A continuous alarm when your data moves too fast.",16,Color.LTGRAY)); gap(root,26);
-                  speed=text("0.00",64,Color.WHITE); speed.setTypeface(null,Typeface.BOLD); root.addView(speed);
-                  root.addView(text("MB / SECOND  ·  DOWNLOAD + UPLOAD",12,Color.LTGRAY)); gap(root,12);
-                  status=text(MonitorService.message,16,mint); root.addView(status); gap(root,26);
-                  root.addView(text("Alarm threshold · MB/s",16,Color.WHITE));
-                  threshold=new EditText(this); threshold.setTextColor(Color.WHITE); threshold.setSingleLine(true); threshold.setInputType(InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_FLAG_DECIMAL);
-                  threshold.setText(getPreferences(0).getString("threshold","1")); root.addView(threshold,new LinearLayout.LayoutParams(-1,dp(54)));
-                  allNetworks=new Switch(this); allNetworks.setText("Include Wi-Fi and other networks"); allNetworks.setTextColor(Color.WHITE); allNetworks.setChecked(getPreferences(0).getBoolean("all",false)); root.addView(allNetworks,new LinearLayout.LayoutParams(-1,dp(64)));
-                  root.addView(text("Off = mobile data only. 1 MB = 1,000,000 bytes. Speed is sampled about once per second.",13,Color.LTGRAY)); gap(root,22);
-                  start=button("Start monitoring",mint,root); start.setOnClickListener(v -> launch(false));
-                  button("Test continuous alarm",Color.rgb(203,216,229),root).setOnClickListener(v -> launch(true));
-                  button("Stop alarm & monitoring",Color.rgb(255,168,146),root).setOnClickListener(v -> {
-                      stopService(new Intent(this,MonitorService.class));
-                  });
-                  button("Battery settings",Color.rgb(203,216,229),root).setOnClickListener(v -> {
-                      try { startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,android.net.Uri.parse("package:"+getPackageName()))); } catch(Exception e) { Toast.makeText(this,"Open phone settings > Apps > Data Watch > Battery",Toast.LENGTH_LONG).show(); }
-                  });
-                  root.addView(text("The alarm stays on until you stop it, even after speed falls. Use your phone’s alarm volume to adjust loudness. Allow notifications and unrestricted battery use for reliable background monitoring. Monitoring uses battery and must be started again after a restart.",13,Color.LTGRAY));
+              private void paintUnits(){for(int i=0;i<3;i++){unitButtons[i].setTextColor(i==unit?accent:secondary);unitButtons[i].setBackground(shape(i==unit?(dark?0xFF203B35:0xFFE4F3ED):card,11));}if(unitLabel!=null)unitLabel.setText(Prefs.UNITS[unit]);}
+              private void changeUnit(int next){
+                  if(next==unit)return;double bytes;
+                  try{bytes=Double.parseDouble(limitInput.getText().toString().replace(',','.'))*Prefs.factor(unit);}catch(Exception e){bytes=Prefs.limit(this);}
+                  unit=next;prefs.edit().putInt("unit",unit).apply();initializing=true;limitInput.setText(String.format(Locale.US,"%.12f",bytes/Prefs.factor(unit)).replaceAll("0+$","").replaceAll("\\.$",""));initializing=false;
+                  TextView t=(TextView)getWindow().getDecorView().findViewWithTag("limit-unit");if(t!=null)t.setText(Prefs.UNITS[unit]);paintUnits();save(false);if(MonitorService.running)startService(new Intent(this,MonitorService.class).setAction("DISPLAY"));
               }
-              private void launch(boolean test) {
-                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},7);
-                      Toast.makeText(this,"Allow notifications, then tap the button again.",Toast.LENGTH_LONG).show(); return;
-                  }
-                  double value;
-                  try { value=Double.parseDouble(threshold.getText().toString().trim().replace(',','.')); if(!Double.isFinite(value)||value<=0||value>10000) throw new Exception(); }
-                  catch(Exception e) { threshold.setError("Enter a number above 0 and at most 10000"); return; }
-                  getPreferences(0).edit().putString("threshold",threshold.getText().toString()).putBoolean("all",allNetworks.isChecked()).apply();
-                  Intent intent=new Intent(this,MonitorService.class).setAction(test?"TEST":"START").putExtra("threshold",value).putExtra("all",allNetworks.isChecked());
-                  try { startForegroundService(intent); } catch(Exception e) { Toast.makeText(this,"Could not start: "+e.getMessage(),Toast.LENGTH_LONG).show(); }
+              private final Runnable applySettings=()->save(true);
+              private boolean save(boolean update){
+                  if(limitInput==null)return true;
+                  String value=limitInput.getText().toString().trim().replace(',','.');
+                  try{double n=Double.parseDouble(value)*Prefs.factor(unit);if(!Double.isFinite(n)||n<1||n>1_000_000_000_000d)throw new Exception();}
+                  catch(Exception e){limitInput.setError("Use a positive limit of at least 1 byte/s");return false;}
+                  boolean changed=!value.equals(prefs.getString("limit","1"));prefs.edit().putString("limit",value).putInt("unit",unit).apply();if(update&&MonitorService.running&&(changed||!initializing))startService(new Intent(this,MonitorService.class).setAction("UPDATE"));return true;
               }
-              @Override protected void onResume() { super.onResume(); handler.post(refresh); }
-              @Override protected void onPause() { handler.removeCallbacks(refresh); super.onPause(); }
+              private void startMonitoring(){
+                  if(importing){Toast.makeText(this,"Wait for the sound to finish importing",Toast.LENGTH_SHORT).show();return;}
+                  if(!save(false))return;
+                  if(Build.VERSION.SDK_INT>=33&&checkSelfPermission("android.permission.POST_NOTIFICATIONS")!=PackageManager.PERMISSION_GRANTED){pendingStart=true;requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},7);return;}
+                  startForegroundService(new Intent(this,MonitorService.class).setAction("START"));
+              }
+              @Override public void onRequestPermissionsResult(int r,String[] permissions,int[] results){super.onRequestPermissionsResult(r,permissions,results);if(r==7&&pendingStart){pendingStart=false;if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED)startMonitoring();else Toast.makeText(this,"Enable notifications in Android settings for visible alerts",Toast.LENGTH_LONG).show();}}
+              private void overlaySettings(){
+                  if(Settings.canDrawOverlays(this)){new AlertDialog.Builder(this).setTitle("Floating alerts").setMessage("Show a floating alert over other apps when the threshold is exceeded?").setPositiveButton("Enable",(d,w)->{prefs.edit().putBoolean("overlay",true).apply();refreshPermission();}).setNegativeButton("Disable",(d,w)->{prefs.edit().putBoolean("overlay",false).apply();refreshPermission();}).show();}
+                  else{prefs.edit().putBoolean("overlay",true).apply();try{startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:"+getPackageName())));}catch(Exception e){Toast.makeText(this,"Find Data Watch under Android Settings > Display over other apps",Toast.LENGTH_LONG).show();}}
+              }
+              private void refreshPermission(){if(permissionLabel!=null)permissionLabel.setText(Settings.canDrawOverlays(this)?(prefs.getBoolean("overlay",true)?"Enabled · floating alert on a spike":"Disabled · tap to enable"):"Permission needed · tap to allow");}
+              private void chooseSound(){
+                  if(importing)return;
+                  new AlertDialog.Builder(this).setTitle("Alarm sound").setItems(new String[]{"Built-in pulse","Choose a phone sound","Import an audio file"},(d,which)->{
+                      if(which==0){prefs.edit().putString("sound","").putString("sound-name","Built-in pulse").apply();soundLabel.setText("Built-in pulse");}
+                      else if(which==1){Intent i=new Intent(RingtoneManager.ACTION_RINGTONE_PICKER);i.putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE,RingtoneManager.TYPE_ALL);i.putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT,false);i.putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT,true);i.putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE,"Choose alarm sound");try{startActivityForResult(i,20);}catch(Exception e){openAudio();}}
+                      else openAudio();
+                  }).show();
+              }
+              private void openAudio(){try{Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("audio/*").addCategory(Intent.CATEGORY_OPENABLE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);startActivityForResult(i,21);}catch(Exception e){Toast.makeText(this,"No audio file picker is available",Toast.LENGTH_LONG).show();}}
+              @Override protected void onActivityResult(int request,int result,Intent data){
+                  super.onActivityResult(request,result,data);if(result!=RESULT_OK||data==null)return;
+                  Uri uri=request==20?data.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI):data.getData();if(uri==null)return;
+                  String name="Custom audio";try(Cursor c=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){if(c!=null&&c.moveToFirst())name=c.getString(0);}catch(Exception ignored){}
+                  if(request==20){try{name=RingtoneManager.getRingtone(this,uri).getTitle(this);}catch(Exception ignored){}prefs.edit().putString("sound",uri.toString()).putString("sound-name",name).apply();soundLabel.setText(name);return;}
+                  final String title=name;importing=true;soundLabel.setText("Importing audio…");
+                  new Thread(()->{
+                      File temp=new File(getFilesDir(),"alarm-import");boolean success=false;
+                      try(InputStream input=getContentResolver().openInputStream(uri);OutputStream output=new FileOutputStream(temp)){
+                          if(input==null)throw new IOException();byte[] buffer=new byte[8192];long total=0;int count;while((count=input.read(buffer))!=-1){total+=count;if(total>20*1024*1024)throw new IOException("Audio must be under 20 MB");output.write(buffer,0,count);}if(total==0)throw new IOException();success=true;
+                      }catch(Exception e){}
+                      final boolean ok=success&&temp.renameTo(new File(getFilesDir(),"custom-alarm"));
+                      handler.post(()->{importing=false;if(ok){prefs.edit().putString("sound","custom").putString("sound-name",title).apply();soundLabel.setText(title);}else{temp.delete();soundLabel.setText(prefs.getString("sound-name","Built-in pulse"));Toast.makeText(this,"Could not import this audio. Choose a local file under 20 MB.",Toast.LENGTH_LONG).show();}});
+                  },"AudioImport").start();
+              }
+              private final Runnable refresh=new Runnable(){public void run(){
+                  boolean running=MonitorService.running;liveSpeed.setText(String.format(Locale.US,"%.3f",MonitorService.rate/Prefs.factor(unit)));downloadLabel.setText("↓ "+Prefs.rate(MonitorService.download,unit));uploadLabel.setText("↑ "+Prefs.rate(MonitorService.upload,unit));
+                  metricSummary.setText(new String[]{"Download + upload","Download only","Upload only"}[prefs.getInt("metric",0)]+" · decimal units\nAlarm stops at/below the limit, or after 20 seconds.");if(!importing)soundLabel.setText(prefs.getString("sound-name","Built-in pulse"));
+                  status.setText(!running?"PAUSED":MonitorService.above?(MonitorService.muted?"SILENCED":"ABOVE LIMIT"):"● LIVE");status.setTextColor(MonitorService.above?(dark?0xFFFFB495:0xFFBD4D30):accent);monitorButton.setText(running?"Stop monitoring":"Start monitoring");muteButton.setVisibility(MonitorService.above&&!MonitorService.muted?View.VISIBLE:View.GONE);
+                  errorLabel.setText(MonitorService.soundError.isEmpty()?(running?MonitorService.message:""):MonitorService.soundError);errorLabel.setTextColor(MonitorService.soundError.isEmpty()?secondary:(dark?0xFFFFB495:0xFFBD4D30));
+                  if(SystemClock.elapsedRealtime()-lastChart>=1000){chart.push(MonitorService.rate,Prefs.limit(MainActivity.this));lastChart=SystemClock.elapsedRealtime();}handler.postDelayed(this,100);
+              }};
+              @Override protected void onResume(){super.onResume();refreshPermission();handler.post(refresh);}
+              @Override protected void onPause(){handler.removeCallbacks(refresh);handler.removeCallbacks(applySettings);boolean changed=limitInput!=null&&!limitInput.getText().toString().trim().replace(',','.').equals(prefs.getString("limit","1"));save(changed);super.onPause();}
           }
           DATAWATCH_SOURCE_EOF
           mkdir -p 'src/com/datawatch/alarm'
           cat > 'src/com/datawatch/alarm/MonitorService.java' <<'DATAWATCH_SOURCE_EOF'
           package com.datawatch.alarm;
-          
           import android.app.*;
           import android.content.*;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
           import android.media.*;
           import android.net.TrafficStats;
+          import android.net.Uri;
           import android.os.*;
-          import java.util.Locale;
+          import android.provider.Settings;
+          import android.view.*;
+          import android.widget.*;
           
           public class MonitorService extends Service {
-              public static volatile boolean running=false, alarming=false;
-              public static volatile double rate=0;
-              public static volatile String message="Ready when you are";
-              private final Handler handler=new Handler();
-              private PowerManager.WakeLock wakeLock;
-              private MediaPlayer player;
-              private boolean all;
-              private double threshold;
-              private long previous=-1, previousTime;
-              private NotificationManager notifications;
-              private long bytes() {
-                  long rx=all?TrafficStats.getTotalRxBytes():TrafficStats.getMobileRxBytes();
-                  long tx=all?TrafficStats.getTotalTxBytes():TrafficStats.getMobileTxBytes();
-                  return rx<0||tx<0 ? -1 : rx+tx;
-              }
-              private Notification notification() {
+              public static volatile boolean running,above,alarming,muted;
+              public static volatile double rate,download,upload;
+              public static volatile String message="Monitoring is paused",soundError="";
+              private final Handler handler=new Handler(Looper.getMainLooper());
+              private final SpeedWindow window=new SpeedWindow();private final ThresholdState gate=new ThresholdState();
+              private PowerManager.WakeLock wakeLock;private MediaPlayer player;private NotificationManager notifications;private AudioManager audio;private AudioFocusRequest focusRequest;
+              private WindowManager windows;private LinearLayout overlay;private TextView overlaySpeed;
+              private boolean all,attemptedSound;private double threshold;private int interval,unit,metric;private long lastNotification,lastOverlay;
+              private final AudioAttributes attributes=new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build();
+              private int dp(int x){return Math.round(x*getResources().getDisplayMetrics().density);}
+              private void config(){android.content.SharedPreferences p=Prefs.get(this);all=p.getBoolean("all",false);metric=p.getInt("metric",0);threshold=Prefs.limit(this);unit=p.getInt("unit",1);interval=p.getInt("interval",1000);if(interval!=100&&interval!=250&&interval!=500&&interval!=1000)interval=1000;}
+              private PendingIntent action(String a,int n){return PendingIntent.getService(this,n,new Intent(this,MonitorService.class).setAction(a),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);}
+              private Notification notification(boolean alert){
                   PendingIntent open=PendingIntent.getActivity(this,0,new Intent(this,MainActivity.class),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
-                  PendingIntent stop=PendingIntent.getService(this,1,new Intent(this,MonitorService.class).setAction("STOP"),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
-                  return new Notification.Builder(this,"monitor").setSmallIcon(com.datawatch.alarm.R.drawable.icon).setContentTitle(alarming?"Data Watch · ALARM":"Data Watch · monitoring")
-                      .setContentText(message).setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
-                      .addAction(new Notification.Action.Builder(null,"Stop alarm & monitoring",stop).build()).build();
+                  Notification.Builder b=new Notification.Builder(this,alert?"speed-alert-v2":"speed-monitor-v2").setSmallIcon(R.drawable.icon).setColor(0xFF78E1C1).setContentIntent(open).setOnlyAlertOnce(true)
+                      .setContentTitle(alert?"Data limit exceeded":"Data Watch · "+Prefs.rate(rate,unit)).setContentText(alert?Prefs.rate(rate,unit)+" · limit "+Prefs.rate(threshold,unit):message)
+                      .setStyle(new Notification.BigTextStyle().bigText(alert?"Current speed: "+Prefs.rate(rate,unit)+"\nThreshold: "+Prefs.rate(threshold,unit)+"\n"+(muted?"Silenced until speed drops below the limit.":"Alarm stops when usage falls, or after 20 seconds."):message)).setOngoing(true).setCategory(alert?Notification.CATEGORY_ALARM:Notification.CATEGORY_SERVICE);
+                  if(alert&&!muted)b.addAction(new Notification.Action.Builder(null,"Mute this spike",action("MUTE",2)).build());
+                  return b.addAction(new Notification.Action.Builder(null,"Stop monitoring",action("STOP",1)).build()).build();
               }
-              private void alarm() {
-                  if(alarming) return;
-                  try {
-                      player=new MediaPlayer();
-                      player.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build());
-                      android.content.res.AssetFileDescriptor fd=getResources().openRawResourceFd(R.raw.alarm);
-                      player.setDataSource(fd.getFileDescriptor(),fd.getStartOffset(),fd.getLength()); fd.close();
-                      player.setLooping(true); player.prepare(); player.start(); alarming=true;
-                  } catch(Exception e) { if(player!=null) {player.release();player=null;} message="Sound failed. Stop and try again."; }
+              private void startSound(boolean fallback){
+                  if(!gate.shouldSound()||!running)return;
+                  try{
+                      MediaPlayer next=new MediaPlayer();player=next;next.setAudioAttributes(attributes);String uri=Prefs.get(this).getString("sound","");
+                      if(!fallback&&!uri.isEmpty()){if(uri.equals("custom"))next.setDataSource(new java.io.File(getFilesDir(),"custom-alarm").getAbsolutePath());else next.setDataSource(this,Uri.parse(uri));}
+                      else{android.content.res.AssetFileDescriptor fd=getResources().openRawResourceFd(R.raw.alarm);try{next.setDataSource(fd.getFileDescriptor(),fd.getStartOffset(),fd.getLength());}finally{fd.close();}}
+                      next.setLooping(true);next.setOnPreparedListener(mp->{if(mp!=player||!gate.shouldSound()||!running)return;try{mp.start();alarming=true;}catch(Exception e){soundFailed(mp,fallback);}});
+                      next.setOnErrorListener((mp,what,extra)->{soundFailed(mp,fallback);return true;});next.prepareAsync();
+                  }catch(Exception e){soundFailed(player,fallback);}
               }
-              private final Runnable sample=new Runnable() {
-                  public void run() {
-                      long now=SystemClock.elapsedRealtime(), current=bytes();
-                      if(current<0) { rate=0; message="Network statistics unavailable on this phone"; }
-                      else {
-                          rate=RateCalculator.bytesPerSecond(previous,current,now-previousTime);
-                          if(RateCalculator.exceeds(rate,threshold)) alarm();
-                          if(alarming) message="ALARM · tap Stop to silence";
-                          else if(player==null && !message.startsWith("Sound failed")) message=String.format(Locale.US,"%s · %.2f MB/s · limit %.2f",all?"All networks":"Mobile data",rate/1_000_000.0,threshold);
-                      }
-                      previous=current; previousTime=now;
-                      notifications.notify(1,notification()); handler.postDelayed(this,1000);
-                  }
-              };
-              @Override public void onCreate() {
-                  super.onCreate(); notifications=getSystemService(NotificationManager.class);
-                  NotificationChannel channel=new NotificationChannel("monitor","Data monitoring",NotificationManager.IMPORTANCE_LOW); channel.setSound(null,null); notifications.createNotificationChannel(channel);
+              private void soundFailed(MediaPlayer failed,boolean wasFallback){
+                  if(failed!=player)return;if(player!=null){player.release();player=null;}alarming=false;
+                  if(!wasFallback&&gate.shouldSound()){soundError="Selected sound unavailable · using built-in alarm";startSound(true);}else soundError="Audio could not play. Check alarm volume and sound settings.";
               }
-              @Override public int onStartCommand(Intent intent,int flags,int id) {
-                  if(intent==null || "STOP".equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
-                  startForeground(1,notification());
-                  if(!running) {
-                      all=intent.getBooleanExtra("all",false); threshold=intent.getDoubleExtra("threshold",1);
-                      previous=bytes(); previousTime=SystemClock.elapsedRealtime(); running=true;
-                      wakeLock=((PowerManager)getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"DataWatch:Monitor"); wakeLock.acquire();
-                      message="Monitoring started"; handler.postDelayed(sample,1000);
-                  }
-                  if("TEST".equals(intent.getAction())) { alarm(); if(alarming) message="TEST ALARM · tap Stop to silence"; notifications.notify(1,notification()); }
-                  return START_NOT_STICKY;
+              private void beginAlarm(){
+                  attemptedSound=true;focusRequest=new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK).setAudioAttributes(attributes).setOnAudioFocusChangeListener(change->{if(change==AudioManager.AUDIOFOCUS_LOSS||change==AudioManager.AUDIOFOCUS_LOSS_TRANSIENT){soundError="Alarm interrupted by another audio app";stopSound();}}).build();
+                  if(audio.requestAudioFocus(focusRequest)==AudioManager.AUDIOFOCUS_REQUEST_GRANTED)startSound(false);else soundError="Audio focus unavailable. Check phone audio settings.";
               }
-              @Override public void onDestroy() {
-                  handler.removeCallbacksAndMessages(null);
-                  if(player!=null) { player.release(); player=null; }
-                  if(wakeLock!=null && wakeLock.isHeld()) wakeLock.release();
-                  running=false; alarming=false; rate=0; message="Stopped · tap Start to monitor again";
-                  stopForeground(STOP_FOREGROUND_REMOVE); super.onDestroy();
+              private void stopSound(){if(player!=null){player.setOnPreparedListener(null);player.setOnErrorListener(null);player.release();player=null;}alarming=false;if(focusRequest!=null){audio.abandonAudioFocusRequest(focusRequest);focusRequest=null;}}
+              private void removeOverlay(){if(overlay!=null){try{windows.removeView(overlay);}catch(Exception ignored){}overlay=null;overlaySpeed=null;}}
+              private void showOverlay(){
+                  if(!gate.above||gate.muted||!Settings.canDrawOverlays(this)||!Prefs.get(this).getBoolean("overlay",true)){removeOverlay();return;}
+                  if(overlay!=null){overlaySpeed.setText(Prefs.rate(rate,unit)+" / limit "+Prefs.rate(threshold,unit));return;}
+                  try{
+                      overlay=new LinearLayout(this);overlay.setOrientation(1);overlay.setPadding(dp(20),dp(16),dp(20),dp(14));GradientDrawable bg=new GradientDrawable();bg.setColor(0xFF17232B);bg.setCornerRadius(dp(22));bg.setStroke(dp(1),0xFFFFB497);overlay.setBackground(bg);overlay.setElevation(dp(14));
+                      TextView title=new TextView(this);title.setText("Data limit exceeded");title.setTextSize(18);title.setTypeface(null,Typeface.BOLD);title.setTextColor(0xFFFFC4AA);overlay.addView(title);
+                      overlaySpeed=new TextView(this);overlaySpeed.setText(Prefs.rate(rate,unit)+" / limit "+Prefs.rate(threshold,unit));overlaySpeed.setTextSize(15);overlaySpeed.setTextColor(Color.WHITE);overlaySpeed.setPadding(0,dp(8),0,dp(8));overlay.addView(overlaySpeed);
+                      TextView detail=new TextView(this);detail.setText("Alarm stops when usage falls, or after 20 seconds.");detail.setTextColor(0xFFBCC9CE);detail.setTextSize(12);overlay.addView(detail);
+                      Button mute=new Button(this);mute.setText("Mute this spike");mute.setAllCaps(false);mute.setOnClickListener(v->muteSpike());overlay.addView(mute,new LinearLayout.LayoutParams(-1,dp(48)));
+                      WindowManager.LayoutParams p=new WindowManager.LayoutParams(Math.min(getResources().getDisplayMetrics().widthPixels-dp(32),dp(400)),-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,PixelFormat.TRANSLUCENT);p.gravity=Gravity.TOP|Gravity.CENTER_HORIZONTAL;p.y=dp(64);windows.addView(overlay,p);
+                  }catch(Exception e){removeOverlay();}
               }
-              @Override public IBinder onBind(Intent i) { return null; }
+              private final Runnable timeout=()->{if(running&&gate.above){gate.mute();gate.timedOut=true;muted=true;stopSound();removeOverlay();message="Above limit · silenced after 20 seconds";notifications.notify(2,notification(true));}};
+              private void muteSpike(){gate.mute();muted=gate.muted;stopSound();removeOverlay();handler.removeCallbacks(timeout);notifications.notify(2,notification(true));}
+              private void resetSampling(){window.reset();gate.update(0,threshold,false,0);above=muted=false;attemptedSound=false;rate=download=upload=0;soundError="";stopSound();removeOverlay();handler.removeCallbacks(timeout);notifications.cancel(2);}
+              private final Runnable sample=new Runnable(){public void run(){
+                  if(!running)return;long now=SystemClock.elapsedRealtime();long rx=all?TrafficStats.getTotalRxBytes():TrafficStats.getMobileRxBytes(),tx=all?TrafficStats.getTotalTxBytes():TrafficStats.getMobileTxBytes();
+                  boolean valid=window.add(now,rx,tx);download=window.download;upload=window.upload;rate=RateCalculator.selectedRate(download,upload,metric);boolean crossed=gate.update(rate,threshold,valid&&window.ready,now);above=gate.above;muted=gate.muted;
+                  if(crossed){handler.removeCallbacks(timeout);handler.postDelayed(timeout,20000);}
+                  if(!gate.shouldSound())stopSound();if(!above){attemptedSound=false;removeOverlay();notifications.cancel(2);handler.removeCallbacks(timeout);soundError="";}
+                  if(gate.shouldSound()&&!attemptedSound)beginAlarm();
+                  message=!valid?"Traffic readings unavailable on this device":!window.ready?"Measuring first second…":above?(muted?(gate.timedOut?"Above limit · silenced after 20 seconds":"Above limit · muted for this spike"):"Threshold exceeded"):(all?"All networks":"Mobile data")+" · monitoring";
+                  if(crossed||now-lastOverlay>=250){showOverlay();lastOverlay=now;}if(crossed||now-lastNotification>=1000){notifications.notify(1,notification(false));if(above)notifications.notify(2,notification(true));lastNotification=now;}
+                  handler.postDelayed(this,interval);
+              }};
+              @Override public void onCreate(){super.onCreate();notifications=getSystemService(NotificationManager.class);audio=getSystemService(AudioManager.class);windows=getSystemService(WindowManager.class);
+                  NotificationChannel monitor=new NotificationChannel("speed-monitor-v2","Live network speed",NotificationManager.IMPORTANCE_LOW);monitor.setSound(null,null);notifications.createNotificationChannel(monitor);
+                  NotificationChannel alerts=new NotificationChannel("speed-alert-v2","Data limit alerts",NotificationManager.IMPORTANCE_HIGH);alerts.setSound(null,null);alerts.setDescription("Pop-up alerts when network speed exceeds your threshold");notifications.createNotificationChannel(alerts);
+              }
+              @Override public int onStartCommand(Intent i,int flags,int id){
+                  if(i==null||"STOP".equals(i.getAction())){stopSelf();return START_NOT_STICKY;}
+                  if("MUTE".equals(i.getAction())){if(running&&above)muteSpike();else if(!running)stopSelf();return START_NOT_STICKY;}
+                  if("DISPLAY".equals(i.getAction())){if(running){unit=Prefs.get(this).getInt("unit",1);notifications.notify(1,notification(false));if(above)notifications.notify(2,notification(true));}else stopSelf();return START_NOT_STICKY;}
+                  config();startForeground(1,notification(false));if(!running){running=true;wakeLock=((PowerManager)getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"DataWatch:Monitor");wakeLock.acquire();}
+                  handler.removeCallbacks(sample);resetSampling();message="Measuring first second…";handler.post(sample);return START_NOT_STICKY;
+              }
+              @Override public void onDestroy(){running=false;handler.removeCallbacksAndMessages(null);stopSound();removeOverlay();notifications.cancel(2);if(wakeLock!=null&&wakeLock.isHeld())wakeLock.release();above=muted=false;rate=download=upload=0;message="Monitoring is paused";soundError="";stopForeground(STOP_FOREGROUND_REMOVE);super.onDestroy();}
+              @Override public IBinder onBind(Intent i){return null;}
+          }
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'src/com/datawatch/alarm'
+          cat > 'src/com/datawatch/alarm/Prefs.java' <<'DATAWATCH_SOURCE_EOF'
+          package com.datawatch.alarm;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import java.util.Locale;
+          public final class Prefs {
+              public static final String[] UNITS={"KB/s","MB/s","GB/s"};
+              public static final double[] FACTORS={1000d,1_000_000d,1_000_000_000d};
+              public static SharedPreferences get(Context c){return c.getSharedPreferences("datawatch-v2",0);}
+              public static double factor(int u){return FACTORS[Math.max(0,Math.min(2,u))];}
+              public static String rate(double b,int u){return String.format(Locale.US,"%.2f %s",b/factor(u),UNITS[Math.max(0,Math.min(2,u))]);}
+              public static double limit(Context c){try{double v=Double.parseDouble(get(c).getString("limit","1"))*factor(get(c).getInt("unit",1));return Double.isFinite(v)&&v>0?v:1_000_000;}catch(Exception e){return 1_000_000;}}
           }
           DATAWATCH_SOURCE_EOF
           mkdir -p 'src/com/datawatch/alarm'
@@ -215,6 +304,67 @@ jobs:
               public static boolean exceeds(double rate, double thresholdMb) {
                   return rate > thresholdMb * 1_000_000.0;
               }
+              public static double selectedRate(double download,double upload,int metric) {
+                  return metric==1?download:metric==2?upload:download+upload;
+              }
+          }
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'src/com/datawatch/alarm'
+          cat > 'src/com/datawatch/alarm/Sparkline.java' <<'DATAWATCH_SOURCE_EOF'
+          package com.datawatch.alarm;
+          import android.content.Context;
+          import android.graphics.*;
+          import android.view.View;
+          public final class Sparkline extends View {
+              private final double[] samples=new double[50];private int count;private final Paint p=new Paint(3);private final int accent,grid;private double limit=1000000;
+              public Sparkline(Context c,int a,int g){super(c);accent=a;grid=g;setContentDescription("Recent network speed chart");}
+              public void push(double s,double t){System.arraycopy(samples,1,samples,0,49);samples[49]=s;count=Math.min(50,count+1);limit=t;invalidate();}
+              @Override protected void onDraw(Canvas c){
+                  super.onDraw(c);float w=getWidth(),h=getHeight(),pad=8;double max=Math.max(limit*1.35,1);for(double v:samples)max=Math.max(max,v*1.2);
+                  p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(1);p.setColor(grid);for(int i=1;i<4;i++)c.drawLine(0,h*i/4,w,h*i/4,p);
+                  p.setColor(0x66FFAC89);p.setPathEffect(new DashPathEffect(new float[]{8,8},0));float ly=(float)(h-pad-limit/max*(h-2*pad));c.drawLine(0,ly,w,ly,p);p.setPathEffect(null);if(count<2)return;
+                  Path line=new Path();for(int i=0;i<50;i++){float x=w*i/49,y=(float)(h-pad-samples[i]/max*(h-2*pad));if(i==0)line.moveTo(x,y);else line.lineTo(x,y);}
+                  Path fill=new Path(line);fill.lineTo(w,h);fill.lineTo(0,h);fill.close();p.setStyle(Paint.Style.FILL);p.setShader(new LinearGradient(0,0,0,h,new int[]{(accent&0xFFFFFF)|0x40000000,accent&0xFFFFFF},null,Shader.TileMode.CLAMP));c.drawPath(fill,p);p.setShader(null);
+                  p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(3*getResources().getDisplayMetrics().density);p.setColor(accent);p.setStrokeJoin(Paint.Join.ROUND);p.setStrokeCap(Paint.Cap.ROUND);c.drawPath(line,p);
+              }
+          }
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'src/com/datawatch/alarm'
+          cat > 'src/com/datawatch/alarm/SpeedWindow.java' <<'DATAWATCH_SOURCE_EOF'
+          package com.datawatch.alarm;
+          import java.util.ArrayDeque;
+          public final class SpeedWindow {
+              private static final class Point { final long t,r,x; Point(long a,long b,long c){t=a;r=b;x=c;} }
+              private final ArrayDeque<Point> points=new ArrayDeque<>();
+              public double download,upload; public boolean ready;
+              public void reset(){points.clear();download=upload=0;ready=false;}
+              public boolean add(long time,long rx,long tx){
+                  if(rx<0||tx<0){reset();return false;}
+                  Point last=points.peekLast();
+                  if(last!=null&&(time<=last.t||rx<last.r||tx<last.x))reset();
+                  points.addLast(new Point(time,rx,tx));
+                  while(points.size()>2){Point first=points.removeFirst();if(points.peekFirst().t>time-1000){points.addFirst(first);break;}}
+                  Point first=points.peekFirst();long elapsed=time-first.t;ready=elapsed>=1000;
+                  download=RateCalculator.bytesPerSecond(first.r,rx,elapsed);upload=RateCalculator.bytesPerSecond(first.x,tx,elapsed);return true;
+              }
+          }
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'src/com/datawatch/alarm'
+          cat > 'src/com/datawatch/alarm/ThresholdState.java' <<'DATAWATCH_SOURCE_EOF'
+          package com.datawatch.alarm;
+          public final class ThresholdState {
+              public boolean above,muted,timedOut; private long started;
+              public boolean update(double speed,double limit,boolean ready,long now){
+                  boolean next=ready&&Double.isFinite(speed)&&Double.isFinite(limit)&&limit>0&&speed>limit;
+                  boolean crossed=next&&!above;
+                  if(!next){muted=false;timedOut=false;started=0;}
+                  if(crossed)started=now;
+                  above=next;
+                  if(above&&now-started>=20000){muted=true;timedOut=true;}
+                  return crossed;
+              }
+              public void mute(){if(above)muted=true;}
+              public boolean shouldSound(){return above&&!muted;}
           }
           DATAWATCH_SOURCE_EOF
           mkdir -p 'res/drawable'
@@ -223,6 +373,45 @@ jobs:
           <path android:fillColor="#11222E" android:pathData="M0,0h48v48h-48z" />
           <path android:fillColor="#55E4BC" android:pathData="M7,27h7l4,-15 8,25 5,-17 3,7h7v4h-10l-1,-3 -4,16 -8,-25 -1,12h-10z" />
           </vector>
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'tests'
+          cat > 'tests/MonitoringTest.java' <<'DATAWATCH_SOURCE_EOF'
+          import com.datawatch.alarm.*;
+          public class MonitoringTest {
+              private static int checks;
+              private static void check(boolean b,String s){checks++;if(!b)throw new AssertionError(s);}
+              public static void main(String[] args){
+                  ThresholdState gate=new ThresholdState();
+                  check(!gate.update(2000000,1000000,false,0)&&!gate.shouldSound(),"No alarm before a full measured window");
+                  check(!gate.update(1000000,1000000,true,1000)&&!gate.shouldSound(),"Equal threshold must stay silent");
+                  check(!gate.update(999999.999,1000000,true,1100)&&!gate.shouldSound(),"Nearly at threshold must stay silent");
+                  check(gate.update(1000001,1000000,true,2000)&&gate.shouldSound(),"Crossing starts alarm");
+                  check(!gate.update(1100000,1000000,true,21999)&&gate.shouldSound(),"Alarm may last up to 20 seconds");
+                  check(!gate.update(1100000,1000000,true,22000)&&!gate.shouldSound()&&gate.timedOut,"20 second timeout silences the spike");
+                  gate.update(2000000,1000000,true,100000);check(!gate.shouldSound(),"Same spike stays silent after timeout");
+                  gate.update(1000000,1000000,true,100100);check(!gate.muted&&!gate.above,"Falling to threshold rearms");
+                  check(gate.update(1000001,1000000,true,100200)&&gate.shouldSound(),"New spike alarms again");
+                  gate.mute();check(!gate.shouldSound(),"User mute stops current spike");
+                  gate.update(999999,1000000,true,100300);check(!gate.shouldSound(),"Below threshold always stops sound");
+                  gate.update(Double.NaN,1000000,true,100400);check(!gate.shouldSound(),"Invalid rate stays silent");
+                  gate.update(999999,0,true,100500);check(!gate.shouldSound(),"Invalid threshold stays silent");
+                  gate.update(100000000,1000000,false,100600);check(!gate.shouldSound(),"Reset or unavailable samples cannot alarm even at a high rate");
+                  check(RateCalculator.selectedRate(900000,200000,1)==900000,"Download-only excludes upload traffic");
+                  check(RateCalculator.selectedRate(900000,200000,2)==200000,"Upload-only excludes downloads");
+                  check(RateCalculator.selectedRate(900000,200000,0)==1100000,"Combined traffic is explicit");
+                  SpeedWindow window=new SpeedWindow();
+                  check(window.add(0,0,0)&&!window.ready,"First sample is a baseline");
+                  for(int i=1;i<=9;i++){window.add(i*100,80000L*i,20000L*i);check(!window.ready,"Wait for complete first second");}
+                  window.add(1000,800000,200000);check(window.ready&&window.download==800000&&window.upload==200000,"100ms polls correctly report combined one-second rate");
+                  window.add(1100,880000,220000);check(window.download+window.upload==1000000,"Rolling window does not inflate rate");
+                  window.add(1500,1200000,300000);check(window.download+window.upload==1000000,"Delayed sampling uses elapsed time");
+                  window.add(1600,0,0);check(!window.ready&&window.download==0,"Counter reset rearms without false spike");
+                  check(!window.add(1700,-1,0)&&!window.ready,"Unsupported statistics stay silent");
+                  window.add(0,0,0);window.add(1000,0,0);check(window.ready&&window.download==0,"Idle traffic remains zero");
+                  window.add(1000,4000000,0);check(!window.ready,"Duplicate timestamp cannot trigger alarm");
+                  System.out.println(checks+" monitoring, timeout and sampling checks passed.");
+              }
+          }
           DATAWATCH_SOURCE_EOF
           mkdir -p 'tests'
           cat > 'tests/RateCalculatorTest.java' <<'DATAWATCH_SOURCE_EOF'
@@ -242,6 +431,63 @@ jobs:
                   check(RateCalculator.bytesPerSecond(0, 9_000_000, 0) == 0, "Zero elapsed time must not trigger");
                   check(RateCalculator.exceeds(500_001, 0.5), "Custom thresholds must work");
                   System.out.println("All 8 network-rate checks passed.");
+              }
+          }
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'tests/ui'
+          cat > 'tests/ui/AndroidManifest.xml' <<'DATAWATCH_SOURCE_EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.datawatch.alarm.tests">
+            <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+            <application android:label="Data Watch UI Checks" />
+            <instrumentation android:name=".UiSmoke" android:targetPackage="com.datawatch.alarm" />
+          </manifest>
+          DATAWATCH_SOURCE_EOF
+          mkdir -p 'tests/ui'
+          cat > 'tests/ui/UiSmoke.java' <<'DATAWATCH_SOURCE_EOF'
+          package com.datawatch.alarm.tests;
+          import android.app.*;
+          import android.content.*;
+          import android.graphics.Bitmap;
+          import android.os.Bundle;
+          import android.view.*;
+          import android.widget.*;
+          import com.datawatch.alarm.*;
+          import java.io.*;
+          
+          public class UiSmoke extends Instrumentation {
+              @Override public void onCreate(Bundle b){super.onCreate(b);start();}
+              private void check(boolean ok,String message){if(!ok)throw new AssertionError(message);}
+              private View find(View root,String description){
+                  if(description.equals(String.valueOf(root.getContentDescription())))return root;
+                  if(root instanceof ViewGroup){ViewGroup g=(ViewGroup)root;for(int i=0;i<g.getChildCount();i++){View v=find(g.getChildAt(i),description);if(v!=null)return v;}}
+                  return null;
+              }
+              private ScrollView scroll(View root){if(root instanceof ScrollView)return (ScrollView)root;if(root instanceof ViewGroup){ViewGroup g=(ViewGroup)root;for(int i=0;i<g.getChildCount();i++){ScrollView s=scroll(g.getChildAt(i));if(s!=null)return s;}}return null;}
+              private void screenshot(String name)throws Exception{
+                  waitForIdleSync();Thread.sleep(350);Bitmap b=getUiAutomation().takeScreenshot();check(b!=null,"Screenshot must exist");
+                  File output=new File(getTargetContext().getExternalFilesDir(null),name+".png");try(OutputStream stream=new FileOutputStream(output)){b.compress(Bitmap.CompressFormat.PNG,100,stream);}b.recycle();
+              }
+              @Override public void onStart(){
+                  Bundle result=new Bundle();
+                  try{
+                      runOnMainSync(()->{Prefs.get(getTargetContext()).edit().clear().putBoolean("dark",true).apply();});
+                      Intent intent=new Intent(getTargetContext(),MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      Activity activity=startActivitySync(intent);waitForIdleSync();Thread.sleep(600);
+                      check(!MonitorService.running&&!MonitorService.alarming,"Opening the app must not start monitoring or alarm");
+                      View decor=activity.getWindow().getDecorView();check(find(decor,"Live network speed")!=null,"Live speed is visible");check(find(decor,"Choose alarm sound")!=null,"Sound selection is available");check(find(decor,"Manage floating alert permission")!=null,"Overlay setting is available");
+                      screenshot("dark-top");runOnMainSync(()->scroll(decor).fullScroll(View.FOCUS_DOWN));screenshot("dark-settings");
+                      runOnMainSync(()->scroll(decor).fullScroll(View.FOCUS_UP));
+                      runOnMainSync(()->find(decor,"Display speed in KB/s").performClick());check(Prefs.get(getTargetContext()).getInt("unit",1)==0,"KB selection saved");check(Prefs.limit(getTargetContext())==1000000,"Unit changes preserve the real limit");
+                      runOnMainSync(()->find(decor,"Display speed in GB/s").performClick());check(Math.abs(Prefs.limit(getTargetContext())-1000000)<0.001,"GB conversion preserves limit");
+                      runOnMainSync(()->find(decor,"Display speed in MB/s").performClick());
+                      ActivityMonitor monitor=addMonitor(MainActivity.class.getName(),null,false);
+                      runOnMainSync(()->find(decor,"Switch to light theme").performClick());Activity light=waitForMonitorWithTimeout(monitor,5000);check(light!=null,"Theme switch recreates UI");removeMonitor(monitor);Thread.sleep(500);screenshot("light-top");
+                      runOnMainSync(()->getTargetContext().startForegroundService(new Intent(getTargetContext(),MonitorService.class).setAction("START")));Thread.sleep(1700);
+                      check(MonitorService.running,"Explicit start begins monitoring");check(!MonitorService.above&&!MonitorService.alarming,"Idle network must not trigger alarm");
+                      check(getTargetContext().getSystemService(NotificationManager.class).getActiveNotifications().length>0,"Monitoring notification exists");
+                      runOnMainSync(()->getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class)));Thread.sleep(400);check(!MonitorService.running&&!MonitorService.alarming,"Stop ends monitoring and audio");
+                      runOnMainSync(()->light.finish());result.putString("summary","UI_SMOKE_OK: dark and light screens, units, permissions, manual start and stop, idle silence");finish(Activity.RESULT_OK,result);
+                  }catch(Throwable error){result.putString("error",error.toString());getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class));finish(Activity.RESULT_CANCELED,result);}
               }
           }
           DATAWATCH_SOURCE_EOF
@@ -275,8 +521,9 @@ jobs:
                   samples.append(struct.pack('<h', int(18000 * envelope * math.sin(2 * math.pi * hz * t))))
               out.writeframes(b''.join(samples))
           PY
-          javac -d build/tests src/com/datawatch/alarm/RateCalculator.java tests/RateCalculatorTest.java
+          javac -d build/tests src/com/datawatch/alarm/RateCalculator.java src/com/datawatch/alarm/SpeedWindow.java src/com/datawatch/alarm/ThresholdState.java tests/RateCalculatorTest.java tests/MonitoringTest.java
           java -cp build/tests RateCalculatorTest
+          java -cp build/tests MonitoringTest
           "$BT/aapt2" compile --dir res -o build/resources.zip
           "$BT/aapt2" link -o build/base.apk --manifest AndroidManifest.xml -I "$PLATFORM" --java build/generated --min-sdk-version 26 --target-sdk-version 35 -0 wav build/resources.zip
           find src build/generated -name '*.java' | sort > build/sources.txt
@@ -294,9 +541,48 @@ jobs:
           sha256sum dist/DataWatch.apk > dist/DataWatch.apk.sha256
           ls -lh dist/DataWatch.apk
           DATAWATCH_SOURCE_EOF
+          cat > 'test-ui.sh' <<'DATAWATCH_SOURCE_EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME}"
+          export PATH="$JAVA_HOME/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          PLATFORM="$ANDROID_HOME/platforms/android-35/android.jar"
+          mkdir -p build/ui-classes build/ui-dex ui-results
+          "$BT/aapt2" link --manifest tests/ui/AndroidManifest.xml -I "$PLATFORM" -o build/ui-base.apk
+          javac --release 8 -classpath "$PLATFORM:build/classes" -d build/ui-classes tests/ui/UiSmoke.java
+          jar cf build/ui-tests.jar -C build/ui-classes .
+          "$BT/d8" --lib "$PLATFORM" --classpath build/classes.jar --min-api 26 --output build/ui-dex build/ui-tests.jar
+          jar uf build/ui-base.apk -C build/ui-dex classes.dex
+          "$BT/zipalign" -f 4 build/ui-base.apk build/ui-aligned.apk
+          "$BT/apksigner" sign --ks build/personal.keystore --ks-key-alias datawatch --ks-pass pass:android --out build/ui-tests.apk build/ui-aligned.apk
+          sdkmanager 'emulator' 'system-images;android-35;google_apis;x86_64' > ui-results/sdk.txt
+          echo no | avdmanager create avd --force --name datawatch --package 'system-images;android-35;google_apis;x86_64' --device pixel_5
+          sudo chmod a+rw /dev/kvm
+          emulator -avd datawatch -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -accel on > ui-results/emulator.txt 2>&1 &
+          timeout 240 bash -c 'until adb shell getprop sys.boot_completed 2>/dev/null | grep -q 1; do sleep 3; done'
+          adb shell input keyevent 82
+          adb install -r dist/DataWatch.apk
+          adb install -r build/ui-tests.apk
+          adb shell pm grant com.datawatch.alarm android.permission.POST_NOTIFICATIONS
+          adb shell am instrument -w com.datawatch.alarm.tests/.UiSmoke | tee ui-results/result.txt
+          adb pull /sdcard/Android/data/com.datawatch.alarm/files/ ui-results/screenshots || true
+          adb logcat -d -s AndroidRuntime > ui-results/crashes.txt
+          grep -q UI_SMOKE_OK ui-results/result.txt
+          DATAWATCH_SOURCE_EOF
       - name: Test, build and verify installable APK
         shell: bash
         run: bash build.sh
+      - name: Verify UI and idle alarm behavior on Android
+        shell: bash
+        run: bash test-ui.sh
+      - name: Save UI verification screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DataWatch-UI-checks
+          path: ui-results/
+          retention-days: 14
       - name: Download your APK from this run
         uses: actions/upload-artifact@v4
         with:
