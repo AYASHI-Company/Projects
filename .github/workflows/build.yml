@@ -449,6 +449,8 @@ jobs:
           import android.content.*;
           import android.graphics.Bitmap;
           import android.os.Bundle;
+          import android.os.ParcelFileDescriptor;
+          import android.provider.Settings;
           import android.view.*;
           import android.widget.*;
           import com.datawatch.alarm.*;
@@ -466,6 +468,9 @@ jobs:
               private void screenshot(String name)throws Exception{
                   waitForIdleSync();Thread.sleep(350);Bitmap b=getUiAutomation().takeScreenshot();check(b!=null,"Screenshot must exist");
                   File output=new File(getTargetContext().getExternalFilesDir(null),name+".png");try(OutputStream stream=new FileOutputStream(output)){b.compress(Bitmap.CompressFormat.PNG,100,stream);}b.recycle();
+              }
+              private void shell(String command)throws Exception{
+                  try(InputStream input=new ParcelFileDescriptor.AutoCloseInputStream(getUiAutomation().executeShellCommand(command))){byte[] buf=new byte[4096];while(input.read(buf)!=-1){}}
               }
               @Override public void onStart(){
                   Bundle result=new Bundle();
@@ -486,7 +491,21 @@ jobs:
                       check(MonitorService.running,"Explicit start begins monitoring");check(!MonitorService.above&&!MonitorService.alarming,"Idle network must not trigger alarm");
                       check(getTargetContext().getSystemService(NotificationManager.class).getActiveNotifications().length>0,"Monitoring notification exists");
                       runOnMainSync(()->getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class)));Thread.sleep(400);check(!MonitorService.running&&!MonitorService.alarming,"Stop ends monitoring and audio");
-                      runOnMainSync(()->light.finish());result.putString("summary","UI_SMOKE_OK: dark and light screens, units, permissions, manual start and stop, idle silence");finish(Activity.RESULT_OK,result);
+                      // Exercise the production service using traffic inside the emulator's virtual network.
+                      // This does not contact an Internet server or use the user's mobile connection.
+                      shell("appops set com.datawatch.alarm SYSTEM_ALERT_WINDOW allow");check(Settings.canDrawOverlays(getTargetContext()),"Overlay permission granted in emulator");
+                      try(InputStream input=getTargetContext().getResources().openRawResource(R.raw.alarm);OutputStream output=new FileOutputStream(new File(getTargetContext().getFilesDir(),"custom-alarm"))){byte[] buf=new byte[4096];int count;while((count=input.read(buf))!=-1)output.write(buf,0,count);}
+                      runOnMainSync(()->Prefs.get(getTargetContext()).edit().putBoolean("all",true).putInt("unit",0).putString("limit","16").putInt("interval",100).putString("sound","custom").putBoolean("overlay",true).apply());
+                      runOnMainSync(()->getTargetContext().startForegroundService(new Intent(getTargetContext(),MonitorService.class).setAction("START")));
+                      Thread traffic=new Thread(()->{try{shell("ping -w 28 -i 0.2 -c 160 -s 16000 10.0.2.2");}catch(Exception e){throw new RuntimeException(e);}},"EmulatorTraffic");traffic.start();
+                      for(int attempt=0;attempt<80&&!MonitorService.alarming;attempt++)Thread.sleep(100);
+                      check(MonitorService.above&&MonitorService.alarming,"Real traffic strictly above threshold starts actual audio");check(MonitorService.soundError.isEmpty(),"Custom audio plays without fallback");
+                      check(getTargetContext().getSystemService(NotificationManager.class).getActiveNotifications().length>=2,"Threshold alert notification appears");
+                      runOnMainSync(()->getTargetContext().startActivity(new Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)));Thread.sleep(600);screenshot("floating-alert-over-settings");
+                      Thread.sleep(20500);check(MonitorService.above&&MonitorService.muted&&!MonitorService.alarming,"Sustained spike is silent after 20 seconds");
+                      traffic.join(12000);check(!traffic.isAlive(),"Local traffic generator finished");Thread.sleep(2000);check(!MonitorService.above&&!MonitorService.alarming,"Traffic drop rearms without playing sound");
+                      runOnMainSync(()->getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class)));Thread.sleep(200);check(!MonitorService.running,"Service stops after integration test");
+                      runOnMainSync(()->light.finish());result.putString("summary","UI_SMOKE_OK: themes, units, manual start/stop, idle silence, real traffic alarm, custom audio, notification, overlay over Settings, 20-second timeout and rearm");finish(Activity.RESULT_OK,result);
                   }catch(Throwable error){result.putString("error",error.toString());getTargetContext().stopService(new Intent(getTargetContext(),MonitorService.class));finish(Activity.RESULT_CANCELED,result);}
               }
           }
