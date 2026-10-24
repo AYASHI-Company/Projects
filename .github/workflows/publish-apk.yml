@@ -1,0 +1,45 @@
+name: Publish installable Data Watch APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/publish-apk.yml'
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Publish the already verified APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download 40044424099 --repo "$GITHUB_REPOSITORY" --name DataWatch-APK --dir dist
+          (cd dist && sha256sum --check <(sed 's@dist/@@' DataWatch.apk.sha256))
+          cat > release-notes.md <<'NOTES'
+          ## Install on Android
+
+          **[Download DataWatch.apk (66 KB)](https://github.com/AYASHI-Company/Projects/releases/download/datawatch-v1.0.0/DataWatch.apk)**
+
+          1. Open the link on your Android phone (Android 8 or newer).
+          2. Open DataWatch.apk. If prompted, allow installation from the browser or Files app, then tap Install.
+          3. Open Data Watch, allow notifications, and set your phone's alarm volume.
+          4. Tap Test continuous alarm, then Stop alarm & monitoring to silence the test.
+          5. Leave the threshold at 1 MB/s and tap Start monitoring.
+
+          Mobile data downloads plus uploads above 1 MB/s trigger a continuous alarm until you stop it. Wi-Fi monitoring is optional. No internet permission or ads.
+
+          Allow unrestricted battery use in Android app settings for background monitoring. Phone sound settings and battery management may affect operation. Start monitoring again after restarting your phone.
+
+          The APK was built on GitHub, with passing rate-calculation and signature checks. It has not yet been tested on a real phone.
+          NOTES
+          if gh release view datawatch-v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload datawatch-v1.0.0 dist/DataWatch.apk --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit datawatch-v1.0.0 --repo "$GITHUB_REPOSITORY" --draft=false --latest --title 'Data Watch 1.0 - Install on Android' --notes-file release-notes.md
+          else
+            gh release create datawatch-v1.0.0 dist/DataWatch.apk --repo "$GITHUB_REPOSITORY" --target 223616698a50618f12af0f9dcd59171dad3937ed --latest --title 'Data Watch 1.0 - Install on Android' --notes-file release-notes.md
+          fi
